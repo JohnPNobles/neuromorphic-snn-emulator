@@ -1,3 +1,4 @@
+mod poisson_encoder;
 mod snn;
 
 use embedded_hal::delay::DelayNs;
