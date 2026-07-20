@@ -2,6 +2,8 @@
     Fixed-Point Neuromorphic Crossbar Array Emulator (Safe Stack)
 */
 
+use crate::learning::LearningRule;
+
 #[derive(Debug, Clone)]
 pub struct LifNeuron {
     pub voltage: i32,
@@ -61,23 +63,37 @@ impl NeuromorphicCore {
         }
     }
 
-    pub fn forward_clock_cycle(&mut self, axon_spikes: &[i32]) -> Vec<bool> {
+    pub fn forward_clock_cycle(
+        &mut self,
+        axon_spikes: &[i32],
+        learning_rule: Option<&impl LearningRule>,
+    ) -> Vec<i32> {
         let num_neurons = self.neurons.len();
-        let mut core_outputs = vec![false; num_neurons];
-        let mut accumulated_currents = vec![0_i32; num_neurons];
+        let mut outward_spikes = vec![0; num_neurons];
 
-        // 1. Decaying Pre- and Post-Synaptic STDP Timing Traces
+        // 1. Decay Traces
         for trace in self.axon_traces.iter_mut() {
-            *trace = (*trace * self.trace_decay_rate) / 10;
+            if *trace > 0 {
+                *trace -= 1;
+            }
         }
         for trace in self.neuron_traces.iter_mut() {
-            *trace = (*trace * self.trace_decay_rate) / 10;
+            if *trace > 0 {
+                *trace -= 1;
+            }
         }
 
-        // 2. Crossbar Matrix Multiplication & Axon Trace Forcing
-        for (axon_idx, &spiked) in axon_spikes.iter().enumerate() {
-            if spiked == 1 {
-                self.axon_traces[axon_idx] = 100; // Force trace ceiling upon impulse
+        // 2. Capture incoming spikes into traces
+        for axon_idx in 0..axon_spikes.len() {
+            if axon_spikes[axon_idx] == 1 {
+                self.axon_traces[axon_idx] = 100; // Reset trace to max strength
+            }
+        }
+
+        // 3. Accumulate currents
+        let mut accumulated_currents = vec![0_i32; num_neurons];
+        for axon_idx in 0..axon_spikes.len() {
+            if axon_spikes[axon_idx] == 1 {
                 for neuron_idx in 0..num_neurons {
                     accumulated_currents[neuron_idx] = accumulated_currents[neuron_idx]
                         .saturating_add(self.synaptic_weights[axon_idx][neuron_idx]);
@@ -85,37 +101,47 @@ impl NeuromorphicCore {
             }
         }
 
-        // 3. Parallel Integration & Leak Step
-        for neuron_idx in 0..num_neurons {
-            self.neurons[neuron_idx].integrate_and_leak(accumulated_currents[neuron_idx]);
-        }
-
-        // 4. Threshold Evaluation with Immediate Winner-Take-All (WTA) Inhibition
-        let mut someone_spiked = false;
+        // 4. Integrate voltages and check for spikes
         let mut winner_idx = 0;
+        let mut max_voltage = -1;
+        let mut someone_spiked = false;
 
         for neuron_idx in 0..num_neurons {
-            if self.neurons[neuron_idx].voltage >= self.neurons[neuron_idx].threshold {
-                core_outputs[neuron_idx] = true;
-                someone_spiked = true;
-                winner_idx = neuron_idx;
-                break; // Hard WTA selection: First index matching condition suppresses others
-            }
-        }
+            let n = &mut self.neurons[neuron_idx];
+            n.voltage = n.voltage.saturating_add(accumulated_currents[neuron_idx]);
 
-        // 5. Apply Resets and Update Post-Synaptic Traces
-        if someone_spiked {
-            for neuron_idx in 0..num_neurons {
-                if neuron_idx == winner_idx {
-                    self.neurons[neuron_idx].voltage = self.neurons[winner_idx].reset_voltage;
-                    self.neuron_traces[neuron_idx] = 100; // Impulse spike trace for learning matching
-                } else {
-                    // Lateral Inhibition: Suppress losers back to base potential instantly
-                    self.neurons[neuron_idx].voltage = 0;
+            // Leaky integration decay
+            if n.voltage > 0 {
+                n.voltage -= 1;
+            }
+
+            if n.voltage >= n.threshold {
+                someone_spiked = true;
+                outward_spikes[neuron_idx] = 1;
+                if n.voltage > max_voltage {
+                    max_voltage = n.voltage;
+                    winner_idx = neuron_idx;
                 }
             }
         }
 
-        core_outputs
+        // 5. Lateral Inhibition (WTA) and STDP Weight Adjustment
+        if someone_spiked {
+            for neuron_idx in 0..num_neurons {
+                if neuron_idx == winner_idx {
+                    self.neurons[neuron_idx].voltage = self.neurons[winner_idx].reset_voltage;
+                    self.neuron_traces[neuron_idx] = 100;
+                } else {
+                    self.neurons[neuron_idx].voltage = 0; // Inhibited
+                }
+            }
+
+            // If a learning engine is provided, adjust weights locally based on current axon traces
+            if let Some(rule) = learning_rule {
+                rule.adjust_weights(&mut self.synaptic_weights, &self.axon_traces, winner_idx);
+            }
+        }
+
+        outward_spikes
     }
 }

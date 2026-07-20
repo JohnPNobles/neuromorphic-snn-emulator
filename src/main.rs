@@ -1,6 +1,8 @@
+mod learning;
 mod poisson_encoder;
 mod snn;
 
+use crate::learning::StdpLearning;
 use embedded_hal::delay::DelayNs;
 use plotters::prelude::*;
 use snn::NeuromorphicCore;
@@ -76,23 +78,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let v1_before = (chip_core.neurons[1].voltage as f32) / 100.0;
         let v2_before = (chip_core.neurons[2].voltage as f32) / 100.0;
 
-        // Step physics engine forward
-        let output_spikes = chip_core.forward_clock_cycle(active_pins);
+        // Pass None as the second argument to bypass learning during standard execution
+        let output_spikes = chip_core.forward_clock_cycle(active_pins, None::<&StdpLearning>);
 
-        // Record historical voltage profile
-        n0_voltage.push(v0_before);
-        n1_voltage.push(v1_before);
-        n2_voltage.push(v2_before);
-
-        // Record specific coordinate locations where spikes triggered
-        if output_spikes[0] {
-            n0_spikes.push((current_time, 2.0f32));
+        // Change boolean checks to compare against integer 1
+        if output_spikes[0] == 1 {
+            // Your logic for neuron 0 spiking
         }
-        if output_spikes[1] {
-            n1_spikes.push((current_time, 2.0f32));
+        if output_spikes[1] == 1 {
+            // Your logic for neuron 1 spiking
         }
-        if output_spikes[2] {
-            n2_spikes.push((current_time, 2.0f32));
+        if output_spikes[2] == 1 {
+            // Your logic for neuron 2 spiking
         }
 
         println!(
