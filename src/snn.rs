@@ -98,14 +98,16 @@ impl NeuromorphicCore {
             }
         }
 
-        // 4. Winner-Take-All lateral inhibition
+        // 4. SOFT Winner-Take-All lateral inhibition (Enables Ensemble Co-firing)
         if let Some(winner) = winner_idx {
             output_spikes[winner] = 1;
+
             for i in 0..self.neurons.len() {
                 if i == winner {
-                    self.neurons[i].voltage = self.neurons[i].reset_voltage;
+                    self.neurons[i].voltage = self.neurons[i].reset_voltage; // Reset winner to 0
                 } else {
-                    self.neurons[i].voltage = 0; // Lock out competitors
+                    // SOFT INHIBITION: Reduce competitor potentials by 20 mV instead of wiping to 0
+                    self.neurons[i].voltage = (self.neurons[i].voltage - 20).max(0);
                 }
             }
         }
