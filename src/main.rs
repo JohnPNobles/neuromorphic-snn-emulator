@@ -11,25 +11,22 @@ use crate::receptive_field::ReceptiveFieldEncoder;
 use crate::snn::NeuromorphicCore;
 
 fn main() {
-    println!("Loading Gaussian Population-Coded Neuromorphic Pipeline...");
+    println!("Loading High-Resolution Gaussian Neuromorphic Pipeline...");
 
     let raw_features = 13;
-    let fields_per_feature = 3;
-    let num_axons = raw_features * fields_per_feature; // 39 Input Axons!
+    let fields_per_feature = 5; // Upgraded: 5 Receptive Fields per feature
+    let num_axons = raw_features * fields_per_feature; // 65 Input Axons!
     let num_neurons = 3;
 
-    // Initialize expanding crossbar matrix [39 axons][3 output neurons]
-    let initial_weights = vec![vec![15_i32; num_neurons]; num_axons];
+    // Expand crossbar array to 65x3
+    let initial_weights = vec![vec![12_i32; num_neurons]; num_axons];
     let mut chip_core = NeuromorphicCore::new(num_axons, num_neurons, initial_weights);
 
     let pop_encoder = ReceptiveFieldEncoder::new(raw_features, fields_per_feature);
     let poisson = PoissonEncoder::new();
 
-    // Balanced STDP parameters on population-coded inputs
-    let stdp_rule = StdpLearning::new(1, 2, 0, 45);
-
-    let mut thresholds = vec![45_i32; num_neurons];
-    let base_threshold = 35_i32;
+    let mut thresholds = vec![40_i32; num_neurons];
+    let base_threshold = 30_i32;
 
     match WineDatasetLoader::load_from_file("wine.data") {
         Ok(mut dataset) => {
@@ -46,64 +43,68 @@ fn main() {
                 dataset.swap(i, j);
             }
 
-            // 2. Clean 80/20 Split
+            // 2. 80/20 Split
             let train_size = (dataset.len() as f32 * 0.8) as usize;
             let train_set = &dataset[0..train_size];
             let test_set = &dataset[train_size..];
 
             // =========================================================================
-            // PHASE 1: UNSUPERVISED TRAINING (STDP ON)
+            // PHASE 1: MULTI-EPOCH TRAINING (STDP ON | 65 AXONS)
             // =========================================================================
-            println!("\n--- Phase 1: Training Phase (39 Population Input Pins) ---");
+            let epochs = 3;
+            println!(
+                "\n--- Phase 1: Training Phase ({} Epochs | {} Input Axons) ---",
+                epochs, num_axons
+            );
 
-            for (idx, sample) in train_set.iter().enumerate() {
-                for i in 0..num_neurons {
-                    chip_core.neurons[i].threshold = thresholds[i];
-                }
+            for epoch in 1..=epochs {
+                // Anneal STDP rate slightly each epoch
+                let pos_stdp = (2 - (epoch - 1)) as i32;
+                let stdp_rule = StdpLearning::new(pos_stdp.max(1), 2, 0, 45);
 
-                // Transform 13 floats into 39 Gaussian density curves
-                let pop_densities = pop_encoder.encode_to_densities(&sample.features);
-                let mut sample_spikes = vec![0; num_neurons];
-
-                for _step in 0..20 {
-                    let active_pins = poisson.encode_features_to_spikes(&pop_densities);
-                    let output_spikes =
-                        chip_core.forward_clock_cycle(&active_pins, Some(&stdp_rule));
-
+                for sample in train_set.iter() {
                     for i in 0..num_neurons {
-                        if output_spikes[i] == 1 {
-                            sample_spikes[i] += 1;
+                        chip_core.neurons[i].threshold = thresholds[i];
+                    }
+
+                    let pop_densities = pop_encoder.encode_to_densities(&sample.features);
+                    let mut sample_spikes = vec![0; num_neurons];
+
+                    for _step in 0..20 {
+                        let active_pins = poisson.encode_features_to_spikes(&pop_densities);
+                        let output_spikes =
+                            chip_core.forward_clock_cycle(&active_pins, Some(&stdp_rule));
+
+                        for i in 0..num_neurons {
+                            if output_spikes[i] == 1 {
+                                sample_spikes[i] += 1;
+                            }
                         }
                     }
-                }
 
-                // Homeostasis threshold tuning
-                for i in 0..num_neurons {
-                    if sample_spikes[i] > 0 {
-                        thresholds[i] += 5;
-                    } else {
-                        thresholds[i] = (thresholds[i] - 1).max(base_threshold);
+                    // Homeostasis threshold tuning
+                    for i in 0..num_neurons {
+                        if sample_spikes[i] > 0 {
+                            thresholds[i] += 4;
+                        } else {
+                            thresholds[i] = (thresholds[i] - 1).max(base_threshold);
+                        }
+                    }
+
+                    for neuron in chip_core.neurons.iter_mut() {
+                        neuron.voltage = 0;
                     }
                 }
-
-                for neuron in chip_core.neurons.iter_mut() {
-                    neuron.voltage = 0;
-                }
-
-                if idx % 40 == 0 {
-                    println!(
-                        " -> Sample {}/{} | Firing: {:?}",
-                        idx,
-                        train_set.len(),
-                        sample_spikes
-                    );
-                }
+                println!(" -> Epoch {}/{} Complete.", epoch, epochs);
             }
 
-            println!("\nTraining complete! Population-Coded Matrix Dimensions: 39x3");
+            println!(
+                "\nTraining complete! Crossbar Array Dimensions: {}x{}",
+                num_axons, num_neurons
+            );
 
             // =========================================================================
-            // PHASE 2: UNAMBIGUOUS 1-TO-1 HUNGARIAN MAPPING
+            // PHASE 2: 1-TO-1 OPTIMAL LABEL MAPPING
             // =========================================================================
             println!("\n--- Phase 2: Generating Neuromorphic Label Maps ---");
 
@@ -139,7 +140,7 @@ fn main() {
                 }
             }
 
-            // Global 1-to-1 Match Assignment
+            // Global 1-to-1 Hungarian Matching
             let mut neuron_assignments = vec![0_usize; num_neurons];
             let mut claimed_classes = vec![false; 3];
 
@@ -169,17 +170,18 @@ fn main() {
                     }
                 }
                 println!(
-                    " -> Spatial Mapping: Neuron Index {} => Assigned Cultivar {}",
+                    " -> Spatial Mapping: Neuron Index {} => Assigned Cultivar {} (Affinity Matrix: {:?})",
                     n,
-                    neuron_assignments[n] + 1
+                    neuron_assignments[n] + 1,
+                    assignment_matrix[n]
                 );
             }
 
             // =========================================================================
-            // PHASE 3: EVALUATION TESTING PHASE
+            // PHASE 3: EVALUATION TESTING PHASE (EXTENDED TIMESTEPS)
             // =========================================================================
             println!(
-                "\n--- Phase 3: Testing Phase (SAMPLES: {}) ---",
+                "\n--- Phase 3: Beginning Testing Phase (SAMPLES: {}) ---",
                 test_set.len()
             );
             let mut correct_predictions = 0;
@@ -189,7 +191,8 @@ fn main() {
                 let pop_densities = pop_encoder.encode_to_densities(&sample.features);
                 let mut spike_counts = vec![0; num_neurons];
 
-                for _step in 0..20 {
+                // 30 timesteps during test phase to eliminate Poisson edge noise
+                for _step in 0..30 {
                     let active_pins = poisson.encode_features_to_spikes(&pop_densities);
                     let output_spikes =
                         chip_core.forward_clock_cycle(&active_pins, None::<&StdpLearning>);
@@ -227,7 +230,7 @@ fn main() {
 
             println!("\n=============================================");
             println!(
-                " PopSAN (Gaussian 39-Pin) Accuracy: {:.2}% ({}/{})",
+                " High-Res PopSAN (65-Pin) Accuracy: {:.2}% ({}/{})",
                 accuracy,
                 correct_predictions,
                 test_set.len()
