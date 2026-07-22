@@ -9,24 +9,41 @@ use crate::learning::StdpLearning;
 use crate::poisson_encoder::PoissonEncoder;
 use crate::receptive_field::ReceptiveFieldEncoder;
 use crate::snn::NeuromorphicCore;
+use rand::RngExt;
 
 fn main() {
     println!("Loading High-Resolution Gaussian Neuromorphic Pipeline...");
 
     let raw_features = 13;
-    let fields_per_feature = 5; // Upgraded: 5 Receptive Fields per feature
-    let num_axons = raw_features * fields_per_feature; // 65 Input Axons!
+    let fields_per_feature = 5;
+    let num_axons = raw_features * fields_per_feature; // 65 Input Axons
     let num_neurons = 3;
 
-    // Expand crossbar array to 65x3
-    let initial_weights = vec![vec![12_i32; num_neurons]; num_axons];
+    let mut rng = rand::rng();
+    let mut initial_weights = vec![vec![0_i32; num_neurons]; num_axons];
+    for axon in initial_weights.iter_mut() {
+        for w in axon.iter_mut() {
+            *w = 10 + (rng.random::<u32>() % 5) as i32; // range [10, 14]
+        }
+    }
+
+    // FIX: target sum for weight normalization, matched to the average
+    // initial weight (~12) times the number of axons, so normalization
+    // doesn't immediately yank weights far from their starting point.
+    let target_weight_sum = (num_axons as i32) * 12;
+
     let mut chip_core = NeuromorphicCore::new(num_axons, num_neurons, initial_weights);
 
     let pop_encoder = ReceptiveFieldEncoder::new(raw_features, fields_per_feature);
     let poisson = PoissonEncoder::new();
 
-    let mut thresholds = vec![40_i32; num_neurons];
+    let timesteps = 25;
+
     let base_threshold = 30_i32;
+    let max_threshold = 120_i32;
+    let target_spikes = 4_i32;
+    let homeostasis_gain = 2_i32;
+    let mut thresholds = vec![40_i32; num_neurons];
 
     match WineDatasetLoader::load_from_file("wine.data") {
         Ok(mut dataset) => {
@@ -35,7 +52,6 @@ fn main() {
                 dataset.len()
             );
 
-            // 1. Deterministic LCG Shuffle
             let mut seed = 42_usize;
             for i in (1..dataset.len()).rev() {
                 seed = (seed.wrapping_mul(1103515245).wrapping_add(12345)) % 2147483648;
@@ -43,14 +59,10 @@ fn main() {
                 dataset.swap(i, j);
             }
 
-            // 2. 80/20 Split
             let train_size = (dataset.len() as f32 * 0.8) as usize;
             let train_set = &dataset[0..train_size];
             let test_set = &dataset[train_size..];
 
-            // =========================================================================
-            // PHASE 1: MULTI-EPOCH TRAINING (STDP ON | 65 AXONS)
-            // =========================================================================
             let epochs = 3;
             println!(
                 "\n--- Phase 1: Training Phase ({} Epochs | {} Input Axons) ---",
@@ -58,9 +70,8 @@ fn main() {
             );
 
             for epoch in 1..=epochs {
-                // Anneal STDP rate slightly each epoch
                 let pos_stdp = (2 - (epoch - 1)) as i32;
-                let stdp_rule = StdpLearning::new(pos_stdp.max(1), 2, 0, 45);
+                let stdp_rule = StdpLearning::new(pos_stdp.max(1), 2, 0, 45, target_weight_sum);
 
                 for sample in train_set.iter() {
                     for i in 0..num_neurons {
@@ -70,7 +81,7 @@ fn main() {
                     let pop_densities = pop_encoder.encode_to_densities(&sample.features);
                     let mut sample_spikes = vec![0; num_neurons];
 
-                    for _step in 0..20 {
+                    for _step in 0..timesteps {
                         let active_pins = poisson.encode_features_to_spikes(&pop_densities);
                         let output_spikes =
                             chip_core.forward_clock_cycle(&active_pins, Some(&stdp_rule));
@@ -82,13 +93,10 @@ fn main() {
                         }
                     }
 
-                    // Homeostasis threshold tuning
                     for i in 0..num_neurons {
-                        if sample_spikes[i] > 0 {
-                            thresholds[i] += 4;
-                        } else {
-                            thresholds[i] = (thresholds[i] - 1).max(base_threshold);
-                        }
+                        let delta = (sample_spikes[i] as i32 - target_spikes) * homeostasis_gain;
+                        thresholds[i] =
+                            (thresholds[i] + delta).clamp(base_threshold, max_threshold);
                     }
 
                     for neuron in chip_core.neurons.iter_mut() {
@@ -103,9 +111,6 @@ fn main() {
                 num_axons, num_neurons
             );
 
-            // =========================================================================
-            // PHASE 2: 1-TO-1 OPTIMAL LABEL MAPPING
-            // =========================================================================
             println!("\n--- Phase 2: Generating Neuromorphic Label Maps ---");
 
             let mut assignment_matrix = vec![vec![0_usize; 3]; num_neurons];
@@ -114,7 +119,7 @@ fn main() {
                 let pop_densities = pop_encoder.encode_to_densities(&sample.features);
                 let mut spike_counts = vec![0; num_neurons];
 
-                for _step in 0..20 {
+                for _step in 0..timesteps {
                     let active_pins = poisson.encode_features_to_spikes(&pop_densities);
                     let output_spikes =
                         chip_core.forward_clock_cycle(&active_pins, None::<&StdpLearning>);
@@ -140,7 +145,6 @@ fn main() {
                 }
             }
 
-            // Global 1-to-1 Hungarian Matching
             let mut neuron_assignments = vec![0_usize; num_neurons];
             let mut claimed_classes = vec![false; 3];
 
@@ -177,22 +181,18 @@ fn main() {
                 );
             }
 
-            // =========================================================================
-            // PHASE 3: EVALUATION TESTING PHASE (EXTENDED TIMESTEPS)
-            // =========================================================================
             println!(
                 "\n--- Phase 3: Beginning Testing Phase (SAMPLES: {}) ---",
                 test_set.len()
             );
             let mut correct_predictions = 0;
-            let mut valid_tests = 0;
+            let total_tests = test_set.len();
 
             for sample in test_set.iter() {
                 let pop_densities = pop_encoder.encode_to_densities(&sample.features);
                 let mut spike_counts = vec![0; num_neurons];
 
-                // 30 timesteps during test phase to eliminate Poisson edge noise
-                for _step in 0..30 {
+                for _step in 0..timesteps {
                     let active_pins = poisson.encode_features_to_spikes(&pop_densities);
                     let output_spikes =
                         chip_core.forward_clock_cycle(&active_pins, None::<&StdpLearning>);
@@ -214,7 +214,6 @@ fn main() {
                     if predicted_class == sample.label {
                         correct_predictions += 1;
                     }
-                    valid_tests += 1;
                 }
 
                 for neuron in chip_core.neurons.iter_mut() {
@@ -222,18 +221,12 @@ fn main() {
                 }
             }
 
-            let accuracy = if valid_tests > 0 {
-                (correct_predictions as f32 / valid_tests as f32) * 100.0
-            } else {
-                0.0
-            };
+            let accuracy = (correct_predictions as f32 / total_tests as f32) * 100.0;
 
             println!("\n=============================================");
             println!(
                 " High-Res PopSAN (65-Pin) Accuracy: {:.2}% ({}/{})",
-                accuracy,
-                correct_predictions,
-                test_set.len()
+                accuracy, correct_predictions, total_tests
             );
             println!("=============================================");
         }
