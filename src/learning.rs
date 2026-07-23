@@ -1,5 +1,16 @@
 // src/learning.rs
+//
+// On-chip spike-timing-dependent plasticity (STDP). Entirely integer
+// arithmetic (i64 is used only as a temporary overflow-safe accumulator
+// during weight normalization, never as a fractional value) -- this file
+// is part of the emulated chip's plasticity circuitry, not a host-side
+// convenience.
 
+/// Generic interface for a plasticity rule the crossbar can invoke after
+/// each clock cycle. Allows `NeuromorphicCore::forward_clock_cycle` to stay
+/// agnostic to which specific learning algorithm is plugged in (only STDP
+/// is implemented here, but this trait is what lets inference-only runs
+/// pass `None` instead).
 pub trait LearningRule {
     fn adjust_weights(
         &self,
@@ -9,12 +20,16 @@ pub trait LearningRule {
     );
 }
 
+/// Pair-based STDP rule with bounded weights and synaptic normalization.
+/// `target_weight_sum` is the total incoming weight a neuron's column is
+/// normalized toward after each update, which is what prevents runaway
+/// winner-take-all weight growth (see the normalization step below).
 pub struct StdpLearning {
-    pub ltp_bonus: i32,
-    pub ltd_penalty: i32,
-    pub max_weight: i32,
-    pub min_weight: i32,
-    pub target_weight_sum: i32,
+    pub ltp_bonus: i32,         // Weight increase on long-term potentiation
+    pub ltd_penalty: i32,       // Weight decrease on long-term depression
+    pub max_weight: i32,        // Upper clamp for any single synapse
+    pub min_weight: i32,        // Lower clamp for any single synapse
+    pub target_weight_sum: i32, // Target total weight per neuron's input column
 }
 
 impl StdpLearning {
@@ -36,6 +51,11 @@ impl StdpLearning {
 }
 
 impl LearningRule for StdpLearning {
+    /// Updates only the winning neuron's incoming weight column, then
+    /// renormalizes that column back toward a fixed total. Losing neurons'
+    /// weights are left untouched by this rule -- weight normalization
+    /// (not competitor suppression) is what keeps a single neuron from
+    /// permanently starving the others.
     fn adjust_weights(
         &self,
         weights: &mut Vec<Vec<i32>>,
@@ -46,13 +66,15 @@ impl LearningRule for StdpLearning {
             return;
         }
 
+        // Trace thresholds define the STDP timing window: axons that fired
+        // recently enough (trace still high) get potentiated; axons that
+        // fired too long ago (trace decayed low) get depressed; anything
+        // in between is left alone as a neutral zone to avoid flip-flopping
+        // on small timing jitter.
         let ltp_cutoff = 15;
         let ltd_cutoff = 5;
 
-        // FIX: only the winner is updated. The previous "competitor suppression"
-        // term only ever decreased losing neurons' weights with no path back up,
-        // which permanently killed them (weights floored at min_weight -> zero
-        // current forever -> that neuron can never win again). Removed.
+        // 1. Apply LTP/LTD only to the winning neuron's incoming weights.
         for axon_idx in 0..weights.len() {
             let trace_val = axon_traces[axon_idx];
             let current_weight = weights[axon_idx][winner_neuron_idx];
@@ -64,14 +86,15 @@ impl LearningRule for StdpLearning {
                 let new_weight = current_weight.saturating_sub(self.ltd_penalty);
                 weights[axon_idx][winner_neuron_idx] = std::cmp::max(self.min_weight, new_weight);
             }
-            // neutral zone: leave unchanged
+            // else: neutral zone, weight unchanged this cycle.
         }
 
-        // FIX: synaptic weight normalization. Keeps the winner's *total* incoming
-        // weight roughly constant, so strengthening some axons (LTP) forces a
-        // proportional tradeoff against its own other axons — not against other
-        // neurons. This is what actually prevents one neuron from monopolizing
-        // every sample: its total synaptic "budget" can't grow without bound.
+        // 2. Synaptic weight normalization: rescale the winner's entire
+        //    incoming weight column so its total stays near
+        //    `target_weight_sum`. This is what forces a tradeoff *within*
+        //    a neuron's own synapses (strengthen some axons, weaken
+        //    others) instead of letting one neuron's total input strength
+        //    grow without bound relative to the others.
         let column_sum: i64 = weights
             .iter()
             .map(|row| row[winner_neuron_idx] as i64)

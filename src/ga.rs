@@ -1,11 +1,14 @@
 // src/ga.rs
 //
-// Genetic-algorithm training for the SNN classifier. Instead of local
+// Genetic-algorithm training for the emulated chip. Instead of local
 // spike-timing updates (STDP), each individual in the population *is* a
-// full weight matrix. Fitness is measured by running the network forward
-// (no learning, fixed thresholds) over the training set and scoring
-// classification accuracy after a best-effort neuron -> class assignment
-// (same 1-to-1 matching logic used in the STDP script's Phase 2).
+// full crossbar weight matrix. Fitness is measured by running the chip
+// forward (no learning, fixed thresholds) over the training set and
+// scoring classification accuracy after a best-effort neuron -> class
+// assignment (the same 1-to-1 matching logic used in the STDP script's
+// Phase 2). Weight values (the genome itself) are i32 throughout -- the GA
+// operates entirely within the same integer-only crossbar representation
+// as the STDP pipeline.
 
 use crate::data_loader::WineRecord;
 use crate::learning::StdpLearning;
@@ -14,29 +17,36 @@ use crate::receptive_field::ReceptiveFieldEncoder;
 use crate::snn::NeuromorphicCore;
 use rand::RngExt;
 
+/// One candidate solution: a full [axon][neuron] integer weight matrix,
+/// exactly the same shape and value range as the STDP crossbar.
 #[derive(Clone, Debug)]
 pub struct Genome {
     pub weights: Vec<Vec<i32>>, // [num_axons][num_neurons]
 }
 
+/// All tunable parameters for the GA run, gathered in one place so
+/// `ga_main.rs` can configure a full experiment without touching this file.
 pub struct GaConfig {
     pub num_axons: usize,
     pub num_neurons: usize,
     pub num_classes: usize,
     pub min_weight: i32,
     pub max_weight: i32,
-    pub fixed_threshold: i32,
+    pub fixed_threshold: i32, // Thresholds are NOT evolved -- fixed for every neuron
     pub timesteps: usize,
-    pub fitness_repeats: usize, // repeats per sample to reduce Poisson noise in fitness
+    pub fitness_repeats: usize, // Repeats per sample to reduce Poisson noise in fitness
     pub population_size: usize,
     pub generations: usize,
     pub tournament_size: usize,
     pub elitism: usize,
-    pub mutation_rate: f64, // probability per-gene of mutation
-    pub mutation_span: i32, // max +/- delta applied on mutation
+    pub mutation_rate: f64, // Probability per-gene of mutation
+    pub mutation_span: i32, // Max +/- delta applied on mutation
 }
 
 impl Genome {
+    /// Creates one genome with every weight drawn uniformly at random
+    /// within the allowed weight bounds -- used to seed generation zero
+    /// of the population with maximum diversity.
     pub fn random(cfg: &GaConfig) -> Self {
         let mut rng = rand::rng();
         let mut weights = vec![vec![0_i32; cfg.num_neurons]; cfg.num_axons];
@@ -50,10 +60,12 @@ impl Genome {
     }
 }
 
-/// Runs a genome forward (no learning) over `samples`, builds a neuron->class
-/// assignment matrix from the votes, resolves a 1-to-1 mapping, and returns
-/// (accuracy, neuron_assignments). This mirrors Phase 2 + accuracy scoring
-/// from the STDP script, but is used here purely as a fitness signal.
+/// Builds a chip from this genome's weights, runs every training sample
+/// through it in pure inference mode (no plasticity), and derives both a
+/// neuron->class assignment and a resubstitution accuracy on that same
+/// training set. This accuracy is what the GA optimizes as fitness -- it is
+/// NOT the final reported result (see `ga_main.rs::evaluate_on_fixed_assignment`
+/// for the genuine held-out test evaluation).
 pub fn evaluate_genome(
     genome: &Genome,
     cfg: &GaConfig,
@@ -69,6 +81,10 @@ pub fn evaluate_genome(
     let mut assignment_matrix = vec![vec![0_usize; cfg.num_classes]; cfg.num_neurons];
     let mut per_sample_winner: Vec<Option<usize>> = Vec::with_capacity(samples.len());
 
+    // Run every sample through the chip, tallying which neuron wins for
+    // which true class (repeated `fitness_repeats` times per sample and
+    // summed, to average out some of the Poisson encoding's inherent
+    // trial-to-trial noise before scoring fitness).
     for sample in samples.iter() {
         let densities = encoder.encode_to_densities(&sample.features);
         let mut spike_counts = vec![0_i32; cfg.num_neurons];
@@ -104,6 +120,9 @@ pub fn evaluate_genome(
     let neuron_assignments =
         resolve_assignment(&assignment_matrix, cfg.num_neurons, cfg.num_classes);
 
+    // Score accuracy on the training set using the assignment just derived
+    // from that same set -- this is the fitness value, analogous to a loss
+    // function guiding STDP's weight updates.
     let mut correct = 0;
     for (sample, winner) in samples.iter().zip(per_sample_winner.iter()) {
         if let Some(w) = winner {
@@ -117,8 +136,9 @@ pub fn evaluate_genome(
     (accuracy, neuron_assignments)
 }
 
-/// 1-to-1 greedy matching: same logic as the STDP script's Phase 2,
-/// extracted here so both training and final scoring can share it.
+/// 1-to-1 greedy matching: identical logic to the STDP script's Phase 2,
+/// extracted here so both training approaches share one implementation of
+/// "given vote counts, resolve the best neuron -> class mapping."
 pub fn resolve_assignment(
     assignment_matrix: &[Vec<usize>],
     num_neurons: usize,
@@ -154,6 +174,9 @@ pub fn resolve_assignment(
     neuron_assignments
 }
 
+/// Randomly samples `tournament_size` genomes from the population and
+/// returns the fittest of that sample -- selection pressure without
+/// needing to normalize or scale fitness values.
 fn tournament_select<'a>(
     population: &'a [Genome],
     fitnesses: &[f32],
@@ -173,6 +196,8 @@ fn tournament_select<'a>(
     &population[best_idx]
 }
 
+/// Produces one child genome by independently choosing, for every single
+/// weight cell, which of the two parents to inherit it from.
 fn uniform_crossover(a: &Genome, b: &Genome) -> Genome {
     let mut rng = rand::rng();
     let mut weights = a.weights.clone();
@@ -186,6 +211,10 @@ fn uniform_crossover(a: &Genome, b: &Genome) -> Genome {
     Genome { weights }
 }
 
+/// Applies random integer perturbations to a genome in place: each weight
+/// cell independently has `mutation_rate` probability of being nudged by a
+/// random delta in [-mutation_span, +mutation_span], clamped back into the
+/// legal weight range.
 fn mutate(genome: &mut Genome, cfg: &GaConfig) {
     let mut rng = rand::rng();
     let span = (2 * cfg.mutation_span + 1) as u32;
@@ -199,14 +228,19 @@ fn mutate(genome: &mut Genome, cfg: &GaConfig) {
     }
 }
 
-/// Runs the full GA and returns the best genome found, its train-set fitness,
-/// and its neuron->class assignment (derived from the training set).
+/// Runs the full generational GA loop: evaluate every genome's fitness,
+/// track the best genome ever seen, carry the top `elitism` genomes forward
+/// unchanged, and fill the rest of the next generation via tournament
+/// selection + uniform crossover + mutation. Returns the best genome found
+/// across all generations, its training-set fitness, and its neuron->class
+/// assignment.
 pub fn run_ga(
     cfg: &GaConfig,
     encoder: &ReceptiveFieldEncoder,
     poisson: &PoissonEncoder,
     train_set: &[WineRecord],
 ) -> (Genome, f32, Vec<usize>) {
+    // Generation 0: fully random population for maximum initial diversity.
     let mut population: Vec<Genome> = (0..cfg.population_size)
         .map(|_| Genome::random(cfg))
         .collect();
@@ -214,12 +248,15 @@ pub fn run_ga(
     let mut best_genome: Option<(Genome, f32, Vec<usize>)> = None;
 
     for genr in 1..=cfg.generations {
+        // Evaluate every genome in the current population against the
+        // training set.
         let evaluations: Vec<(f32, Vec<usize>)> = population
             .iter()
             .map(|g| evaluate_genome(g, cfg, encoder, poisson, train_set))
             .collect();
         let fitnesses: Vec<f32> = evaluations.iter().map(|(f, _)| *f).collect();
 
+        // Track this generation's best individual.
         let mut gen_best_idx = 0;
         for i in 1..fitnesses.len() {
             if fitnesses[i] > fitnesses[gen_best_idx] {
@@ -227,6 +264,8 @@ pub fn run_ga(
             }
         }
         let gen_best_fit = fitnesses[gen_best_idx];
+
+        // Update the all-time best genome if this generation beat it.
         if best_genome
             .as_ref()
             .map_or(true, |(_, f, _)| gen_best_fit > *f)
@@ -246,6 +285,8 @@ pub fn run_ga(
             best_genome.as_ref().unwrap().1 * 100.0
         );
 
+        // Rank the population by fitness so the top `elitism` genomes can
+        // be carried forward unchanged.
         let mut ranked_indices: Vec<usize> = (0..population.len()).collect();
         ranked_indices.sort_by(|&a, &b| fitnesses[b].partial_cmp(&fitnesses[a]).unwrap());
 
@@ -254,6 +295,8 @@ pub fn run_ga(
             next_population.push(population[idx].clone());
         }
 
+        // Fill the remainder of the next generation via selection,
+        // crossover, and mutation.
         while next_population.len() < cfg.population_size {
             let parent_a = tournament_select(&population, &fitnesses, cfg.tournament_size);
             let parent_b = tournament_select(&population, &fitnesses, cfg.tournament_size);
